@@ -85,6 +85,7 @@ extension SessionStore {
         sessionID = s.id
         title = s.title
         speaker = s.speaker
+        titleIsAuto = s.titleIsAuto ?? false
         startedAt = s.startedAt
         segments = s.segments
         summaries = s.summaries

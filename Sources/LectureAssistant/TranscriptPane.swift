@@ -65,25 +65,45 @@ struct TranscriptPane: View {
     }
 
     private var header: some View {
-        @Bindable var store = store
-        return VStack(alignment: .leading, spacing: 4) {
-            TextField("讲座标题", text: $store.title)
-                .textFieldStyle(.plain)
-                .font(.system(size: 20, weight: .semibold))
-                .onSubmit { store.scheduleSave() }
+        let titleBinding = Binding<String>(get: { store.title }, set: { store.title = $0; store.titleIsAuto = false })
+        let speakerBinding = Binding<String>(get: { store.speaker }, set: { store.speaker = $0; store.speakerIsAuto = false })
+        return VStack(alignment: .leading, spacing: 6) {
             HStack(spacing: 8) {
-                Text("主讲")
-                TextField("主讲人", text: $store.speaker)
+                TextField("未命名讲座（开讲后 AI 会根据内容自动拟题，也可以直接在这里写）", text: titleBinding)
                     .textFieldStyle(.plain)
-                    .frame(maxWidth: 160)
+                    .font(.system(size: 20, weight: .semibold))
                     .onSubmit { store.scheduleSave() }
-                Text("·  \(Fmt.day.string(from: store.startedAt)) \(Fmt.hm(store.startedAt))")
+                    .help("点这里直接改题目；改过之后 AI 就不会再自动改")
+                if store.titleIsAuto && !store.title.isEmpty {
+                    Text("AI 拟").font(.caption2).padding(.horizontal, 5).padding(.vertical, 1)
+                        .background(Color.accentColor.opacity(0.15), in: Capsule())
+                        .foregroundStyle(Color.accentColor)
+                }
+                Button {
+                    Task { await store.proposeTitle(force: true) }
+                } label: {
+                    if store.isProposingTitle { ProgressView().controlSize(.small) } else { Label("AI 拟题", systemImage: "sparkles") }
+                }
+                .controlSize(.small)
+                .disabled(store.segments.isEmpty || store.isProposingTitle)
+                .help("根据目前的内容重新拟题目和汇报人")
+            }
+            HStack(spacing: 8) {
+                Image(systemName: "person.crop.circle").foregroundStyle(.secondary)
+                TextField("汇报人", text: speakerBinding)
+                    .textFieldStyle(.roundedBorder)
+                    .frame(maxWidth: 200)
+                    .onSubmit { store.scheduleSave() }
+                    .help("随时可以改；改过之后 AI 就不会再自动改")
+                Text("\(Fmt.day.string(from: store.startedAt)) \(Fmt.hm(store.startedAt))")
                 Spacer()
             }
             .font(.callout)
             .foregroundStyle(.secondary)
         }
         .padding(.bottom, 8)
+        .onChange(of: store.title) { store.scheduleSave() }
+        .onChange(of: store.speaker) { store.scheduleSave() }
     }
 
     private var emptyHint: some View {
@@ -145,21 +165,22 @@ struct SegmentRow: View {
                 .padding(.top, 3)
             VStack(alignment: .leading, spacing: 4) {
                 if segment.language == .english {
-                    Text(segment.text)
+                    Text(segment.bestRaw)
                         .font(.system(size: fontSize * 0.93))
                         .foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
+                        .help(rawHelp)
                     secondaryLine
                 } else {
-                    Text(segment.secondary ?? segment.text)
+                    Text(segment.secondary ?? segment.bestRaw)
                         .font(.system(size: fontSize))
                         .fixedSize(horizontal: false, vertical: true)
-                    if let s = segment.secondary, s != segment.text {
-                        Text("识别原文：\(segment.text)")
+                    if let s = segment.secondary, s != segment.bestRaw {
+                        Text("识别原文：\(segment.bestRaw)")
                             .font(.system(size: fontSize * 0.75))
                             .foregroundStyle(.tertiary)
                             .lineLimit(1)
-                            .help(segment.text)
+                            .help(rawHelp)
                     } else if segment.secondaryFailed {
                         Text("校正失败").font(.caption2).foregroundStyle(.orange)
                     }
@@ -186,6 +207,12 @@ struct SegmentRow: View {
             }
             Button("重新翻译/校正") { store.enqueueSecondary([segment.id]) }
         }
+    }
+
+    private var rawHelp: String {
+        var lines = ["系统识别：\(segment.text)"]
+        for (k, v) in (segment.localEngines ?? [:]).sorted(by: { $0.key < $1.key }) { lines.append("\(k)：\(v)") }
+        return lines.joined(separator: "\n")
     }
 
     @ViewBuilder

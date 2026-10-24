@@ -51,9 +51,12 @@ enum SelfTest {
         store.isDemo = true            // 不碰应用真正的崩溃恢复快照
         store.notesDirOverride = out
         store.audioDirOverride = out
-        store.title = "自测讲座"
+        store.title = ""
+        store.titleIsAuto = true
         await store.reindexVault()
         print("== 笔记库：\(store.vaultDocCount) 篇，固定笔记 \(store.pinnedCache.count) 篇")
+        await store.startLocalASR()
+        print("== 本地引擎：\(store.localASRNames.isEmpty ? "没有" : store.localASRNames.joined(separator: ", "))")
         if store.vaultDocCount == 0 { failures.append("vault") }
 
         store.setLanguage(lang)
@@ -90,10 +93,13 @@ enum SelfTest {
         print("== \(lang == .english ? "翻译" : "校正")：\(idle ? "完成" : "超时")，用时 \(String(format: "%.1f", Date().timeIntervalSince(t0)))s")
         for s in store.segments {
             print("  [\(Fmt.clock(s.time))] \(s.text)")
+            for (k, v) in (s.localEngines ?? [:]).sorted(by: { $0.key < $1.key }) { print("     \(k)：\(v)") }
             print("     → \(s.secondary ?? (s.secondaryFailed ? "（失败）" : "（无）"))")
         }
         if store.segments.contains(where: { $0.secondary == nil }) { failures.append("secondary") }
 
+        _ = await waitUntil(40) { !store.isProposingTitle }
+        print("== 识别模型：\(store.asrKindName ?? "（文件模式）")；题目：\(store.displayTitle)（自动=\(store.titleIsAuto)）；汇报人：\(store.speaker)")
         t0 = Date()
         await store.summarize()
         print("== 总结：用时 \(String(format: "%.1f", Date().timeIntervalSince(t0)))s，分段 \(store.summaries.count)")

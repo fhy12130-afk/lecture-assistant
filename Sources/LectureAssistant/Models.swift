@@ -22,18 +22,24 @@ struct Segment: Identifiable, Codable, Equatable {
     var language: LectureLanguage
     var secondary: String?
     var secondaryFailed = false
+    /// 本地引擎（SenseVoice / Paraformer）对同一段音频的识别结果
+    var localText: String?
+    var localEngines: [String: String]?
 
     /// 给 AI 看的一行：时间 + 原文（+ 译文/校正）
     var promptLine: String {
-        var s = "[\(Fmt.clock(time))] \(text)"
+        var s = "[\(Fmt.clock(time))] \(bestRaw)"
         if let sec = secondary, !sec.isEmpty, sec != text {
             s += language == .english ? "\n  （译）\(sec)" : "\n  （校正）\(sec)"
         }
         return s
     }
 
+    /// 还没经过 AI 时，本地引擎的结果一般比系统识别准
+    var bestRaw: String { localText?.isEmpty == false ? localText! : text }
+
     /// 显示和总结时优先用的中文文本
-    var bestChinese: String { secondary?.isEmpty == false ? secondary! : text }
+    var bestChinese: String { secondary?.isEmpty == false ? secondary! : bestRaw }
 }
 
 struct SummaryBlock: Identifiable, Codable {
@@ -91,6 +97,8 @@ struct LectureSession: Codable {
     var markdownPath: String?
     var myNotes = ""
     var lastSummarizedSegmentID: UUID?
+    var titleIsAuto: Bool?
+    var speakerIsAuto: Bool?
 
     var isEmpty: Bool {
         segments.isEmpty && qas.isEmpty && questionSets.isEmpty && myNotes.isEmpty

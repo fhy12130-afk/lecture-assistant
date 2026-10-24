@@ -16,6 +16,7 @@ if [ ! -f Resources/AppIcon.icns ]; then
   iconutil -c icns build/AppIcon.iconset -o Resources/AppIcon.icns
 fi
 cp Resources/AppIcon.icns "$APP/Contents/Resources/AppIcon.icns"
+cp scripts/asr_server.py "$APP/Contents/Resources/asr_server.py"
 
 codesign --force --sign - "$APP"
 codesign --verify "$APP"

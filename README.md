@@ -17,7 +17,9 @@ A native macOS app for academic talks: live transcription, English→Chinese tra
 
 ### 功能
 
-- **实时转写**：用系统自带的离线听写模型识别中文或英文，音频不出本机。按音量检测说话停顿、主动断句，一般 4–15 秒定稿一句。
+- **实时转写**：用系统自带的离线识别模型（优先 SpeechTranscriber 长语音模型，没装时退回听写模型）识别中文或英文，音频不出本机。按音量检测说话停顿、主动断句，一般 4–15 秒定稿一句；有声音却长时间没出字会提示换模型。
+- **自动拟题**：开讲一会儿后 AI 根据内容拟题目、从主持人介绍里认出汇报人；题目和汇报人随时可以直接改，改过就不再自动覆盖。
+- **双引擎 + AI 融合**（可选）：装上本地引擎后，每句话定稿时再用 [sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx) 的 Paraformer 和 SenseVoice 各识别一遍，AI 综合三份结果和上下文还原原话。远场录音上明显比单个模型准。
 - **英译中 / 中文纠错**：英文讲座每句下面出中文翻译；中文讲座自动纠正同音错字和术语（只改读音相近的字词），识别原文一直保留。
 - **自动总结**：每隔几分钟总结新内容，更新整场摘要，并列出和你的研究相关的点。
 - **选句解惑**：点选听不懂的句子（可多选）问 AI。它结合讲座上下文、你的背景和 Obsidian 笔记库里检索到的笔记来解释，还会给出可以追问的问题。可选联网搜索。
@@ -40,6 +42,14 @@ cd lecture-assistant
 ```
 
 构建出来的是 `build/讲座助手.app`，加 `--install` 会复制到 `/Applications`。应用是 ad-hoc 签名，第一次打开如果被系统拦住，在访达里右键 › 打开。
+
+可选，装本地识别引擎（约 500 MB，需要 [uv](https://docs.astral.sh/uv/)）：
+
+```bash
+./scripts/setup_local_asr.sh
+```
+
+装好后重开应用，底部状态栏会显示「+ paraformer/sensevoice」。引擎只监听 127.0.0.1，音频不出本机。
 
 ### 配置
 
@@ -76,8 +86,8 @@ say -v Samantha -o /tmp/en.aiff "Today I will talk about neural operators as sur
 
 ### 已知限制
 
-- 新的长语音模型 SpeechTranscriber 在部分机器上英文模型的下载请求一直不返回，所以统一用听写模型 DictationTranscriber。
-- 听写模型要停顿很久才会自己定稿，所以应用用音量检测停顿来主动断句；会场很吵或回声大时，断句和识别都会变差。
+- 听写模型 DictationTranscriber 对真实会场的远场讲话基本不出字（只对贴近麦克风的清晰语音有效），所以默认优先用长语音模型 SpeechTranscriber。但长语音模型的英文包在部分机器上下载请求一直不返回，这时英文只能退回听写模型，会场里可能识别不出来。
+- 识别模型自己要停顿很久才定稿，所以应用用音量检测停顿来主动断句；离讲者远、会场很吵或回声大时，断句和识别都会变差，尽量坐近音箱。
 - 中文纠错偶尔会把术语改错，原始识别文本始终保留在下面。
 - 目前只支持中文和英文。
 
@@ -89,6 +99,7 @@ say -v Samantha -o /tmp/en.aiff "Today I will talk about neural operators as sur
 | `LLMClient.swift` | Anthropic / OpenAI 兼容接口：流式输出、联网搜索、拒答时换模型重试 |
 | `Assistant.swift` | 翻译、纠错、总结、检索关键词、解惑、提问的提示词 |
 | `VaultSearch.swift` | Obsidian 笔记全文检索 |
+| `LocalASR.swift`、`scripts/asr_server.py` | 本地第二识别引擎（sherpa-onnx） |
 | `SessionStore*.swift` | 会话状态、自动保存、AI 任务调度 |
 | `ContentView.swift` 等 | SwiftUI 界面 |
 | `SelfTest.swift` | 无界面自测 |
@@ -99,7 +110,9 @@ say -v Samantha -o /tmp/en.aiff "Today I will talk about neural operators as sur
 
 ### Features
 
-- **Live transcription** with macOS's on-device dictation model (Chinese or English); audio never leaves your Mac. The app detects pauses from the audio level and finalizes sentence by sentence, usually every 4–15 seconds.
+- **Dual engine + AI fusion** (optional): with the local engine installed, every finalized sentence is re-recognized by [sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx) Paraformer and SenseVoice, and the AI reconciles all three hypotheses with context. Noticeably more accurate on far-field audio than any single model.
+- **Live transcription** with macOS's on-device models (SpeechTranscriber first, falling back to the dictation model when it isn't installed), Chinese or English; audio never leaves your Mac. The app detects pauses from the audio level and finalizes sentence by sentence, usually every 4–15 seconds, and suggests switching models if there is sound but no text.
+- **Auto title**: after a minute or so the AI drafts a title from the content and picks up the speaker's name from the introduction. Both stay editable at any time; once you edit them, they are no longer overwritten.
 - **Translation / correction**: English talks get a Chinese translation under each sentence. Chinese talks get homophone and terminology fixes (only sound-alike substitutions); the raw transcript is always kept.
 - **Rolling summaries**: every few minutes the new part is summarized, the whole-talk summary is updated, and points relevant to your own research are listed.
 - **Ask about a sentence**: tap the sentences you didn't follow and ask the AI. It answers using the talk context, your profile, and notes retrieved from your Obsidian vault, and suggests follow-up questions. Web search is optional.
@@ -122,6 +135,14 @@ cd lecture-assistant
 ```
 
 This builds `build/讲座助手.app`; `--install` copies it to `/Applications`. The app is ad-hoc signed, so if macOS blocks the first launch, right-click it in Finder and choose Open.
+
+Optional local recognition engine (~500 MB, needs [uv](https://docs.astral.sh/uv/)):
+
+```bash
+./scripts/setup_local_asr.sh
+```
+
+Relaunch the app; the status bar then shows "+ paraformer/sensevoice". The engine listens on 127.0.0.1 only; audio stays on your Mac.
 
 ### Configure
 
@@ -158,8 +179,8 @@ Options: `--live 1` feeds the file at real-time speed through the microphone pat
 
 ### Known limitations
 
-- On some machines the English model download for the newer SpeechTranscriber never completes, so the app uses DictationTranscriber for both languages.
-- The dictation model waits for long pauses before finalizing, so the app finalizes on detected pauses; noisy or echoey rooms degrade both segmentation and recognition.
+- DictationTranscriber produces almost nothing on real far-field room audio (it only works on clear close-mic speech), so SpeechTranscriber is preferred. On some machines SpeechTranscriber's English model download never completes; English then falls back to dictation and may not work in a lecture hall.
+- The recognizers wait for long pauses before finalizing, so the app finalizes on detected pauses; distance, noise and echo degrade both segmentation and recognition — sit close to a speaker if you can.
 - Chinese correction occasionally changes a term wrongly; the raw transcript stays visible.
 - Chinese and English only, for now.
 
@@ -171,6 +192,7 @@ Options: `--live 1` feeds the file at real-time speed through the microphone pat
 | `LLMClient.swift` | Anthropic / OpenAI-compatible client: streaming, web search, retry on refusal with another model |
 | `Assistant.swift` | Prompts for translation, correction, summaries, search keywords, Q&A, questions |
 | `VaultSearch.swift` | Full-text search over the Obsidian vault |
+| `LocalASR.swift`, `scripts/asr_server.py` | Local second-opinion recognizer (sherpa-onnx) |
 | `SessionStore*.swift` | Session state, autosave, AI task scheduling |
 | `ContentView.swift` etc. | SwiftUI interface |
 | `SelfTest.swift` | Headless self-test |

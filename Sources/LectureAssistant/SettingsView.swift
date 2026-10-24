@@ -92,11 +92,15 @@ struct LectureSettings: View {
     var body: some View {
         Form {
             Section("新记录的默认值") {
-                TextField("讲座标题", text: $settings.data.sessionTitle)
+                TextField("默认标题（留空 = 根据讲座内容自动拟题）", text: $settings.data.sessionTitle)
                 TextField("主讲人", text: $settings.data.speakerName)
                 TextField("领域（翻译和纠错时参考，如：结构工程、机器学习）", text: $settings.data.domain)
             }
             Section("识别与 AI") {
+                Picker("识别模型", selection: $settings.data.asrEngine) {
+                    ForEach(ASREngine.allCases) { Text($0.label).tag($0) }
+                }
+                Toggle("本地引擎复核每一句（SenseVoice / Paraformer，需先装好）", isOn: $settings.data.localASR)
                 Toggle("英文自动翻译成中文 / 中文自动校正错字", isOn: $settings.data.autoSecondary)
                 Stepper("每 \(settings.data.summaryIntervalMin) 分钟自动总结一次", value: $settings.data.summaryIntervalMin, in: 1...30)
                 Toggle("同时录音（m4a，存进 Obsidian 附件）", isOn: $settings.data.recordAudio)

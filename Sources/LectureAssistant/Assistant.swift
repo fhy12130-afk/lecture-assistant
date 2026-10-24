@@ -32,11 +32,31 @@ enum Assistant {
 
     // MARK: 翻译 / 校正
 
-    struct SecondaryItem: Sendable { var id: Int; var text: String }
+    struct SecondaryItem: Sendable {
+        var id: Int
+        var text: String               // 系统识别
+        var alts: [String: String] = [:]   // 本地引擎名 → 结果
+    }
 
-    static func secondary(_ items: [SecondaryItem], language: LectureLanguage, previous: [String],
+    static func secondary(_ items: [SecondaryItem], language: LectureLanguage, previous: [String], topic: String = "",
                           ctx: Context, client: LLMClient, model: String) async throws -> [Int: String] {
         let glossary = ctx.glossary.joined(separator: "、")
+        let multi = items.contains { !$0.alts.isEmpty }
+        let input = items.map { it -> [String: Any] in
+            var o: [String: Any] = ["id": it.id]
+            if it.alts.isEmpty {
+                o["text"] = it.text
+            } else {
+                o["A_系统识别"] = it.text
+                for (k, v) in it.alts.sorted(by: { $0.key < $1.key }) where !v.isEmpty { o["B_\(k)"] = v }
+            }
+            return o
+        }
+        let fusion = multi ? """
+
+        有的段落给了多套语音识别结果（A_系统识别、B_sensevoice、B_paraformer 等），它们识别的是同一段话，各有错字和漏字。
+        先综合它们还原说话人最可能的原话：几份结果读音相近而用字不同时，选符合上下文和领域的；某一份漏了或多了内容时，以说得通的为准；不能加入任何一份结果里都没有依据的内容。拿不准时优先相信 paraformer，其次 sensevoice。
+        """ : ""
         let system: String
         let key: String
         if language == .english {
@@ -49,6 +69,7 @@ enum Assistant {
             - 转写是机器识别的，可能有同音词错误或断句错误（例如把 "finite element" 识别成 "fine eye development"），按上下文和术语推断原意再翻译。
             - 重要术语第一次出现时在中文后括注英文，例如“神经算子（neural operator）”。
             - 不解释、不总结、不补充原文没有的内容。
+            \(fusion)
             只输出 JSON 数组，格式：[{"id": 1, "zh": "译文"}]
             """
         } else {
@@ -62,12 +83,14 @@ enum Assistant {
             - 补上标点、断句；不改说话人的意思，不润色，不增删内容。
             - 被识别成中文音译的英文术语改回英文原形（PINN、DeepONet、Fourier neural operator 等）。
             - 拿不准就保持原样。
+            \(fusion)
             只输出 JSON 数组，格式：[{"id": 1, "fixed": "校正后的文本"}]
             """
         }
-        let input = items.map { ["id": $0.id, "text": $0.text] as [String: Any] }
+
         let inputJSON = String(decoding: try JSONSerialization.data(withJSONObject: input, options: [.withoutEscapingSlashes]), as: UTF8.self)
         var user = ""
+        if !topic.isEmpty { user += "这场讲座目前讲到的内容（帮助判断术语）：\n\(topic)\n\n" }
         if !previous.isEmpty {
             user += "前文（只供理解上下文，不要处理）：\n" + previous.joined(separator: "\n") + "\n\n"
         }
@@ -137,6 +160,21 @@ enum Assistant {
         if points.isEmpty && overall.isEmpty { points = text.trimmingCharacters(in: .whitespacesAndNewlines) }
         if rel == "无" || rel == "- 无" { rel = "" }
         return SummaryOutput(points: points, overall: overall, relevance: rel)
+    }
+
+    // MARK: 拟题目
+
+    static func titleRequest(excerpt: String, overall: String, currentTitle: String, currentSpeaker: String, ctx: Context, model: String) -> LLMRequest {
+        var user = "下面是一场学术报告的语音转写（可能有错字）\(overall.isEmpty ? "" : "和摘要")。\n\n"
+        if !overall.isEmpty { user += "摘要：\n\(overall)\n\n" }
+        user += "转写：\n\(excerpt)\n\n"
+        user += """
+        请拟一个准确、像正式报告题目的标题（中文，不超过 30 字；讲者自己说了题目就用他说的），并判断汇报人姓名：只有转写里明确出现（比如主持人介绍、讲者自我介绍）才写，否则写空字符串。
+        现在的标题：\(currentTitle.isEmpty ? "（无）" : currentTitle)；现在的汇报人：\(currentSpeaker.isEmpty ? "（无）" : currentSpeaker)。
+        只输出 JSON：{"title": "...", "speaker": "..."}
+        """
+        return LLMRequest(model: model, system: "你帮我给讲座记录拟题目。\(ctx.domainLine)", messages: [ChatMessage(role: "user", content: user)],
+                          maxTokens: 300, effort: .low)
     }
 
     // MARK: 检索关键词

@@ -11,6 +11,35 @@ final class SpeechEngine: @unchecked Sendable {
         var start: Date
         var duration: Double
         var language: LectureLanguage
+        /// 在识别器时间轴上的位置（秒）和识别器编号，用来取这一句的原始音频给本地引擎复核
+        var audioStart: Double = 0
+        var audioEnd: Double = 0
+        var epoch: Int = -1
+    }
+
+    /// 最近 2 分钟的 16 kHz 16 位音频（识别器时间轴），环形存放
+    struct PCMRing {
+        var capacity: Int
+        var buf: [Int16]
+        var written: Int64 = 0
+        init(seconds: Double, rate: Double) {
+            capacity = Int(seconds * rate)
+            buf = [Int16](repeating: 0, count: capacity)
+        }
+        mutating func reset() { written = 0 }
+        mutating func append(_ p: UnsafePointer<Int16>, _ n: Int) {
+            for i in 0..<n {
+                buf[Int((written + Int64(i)) % Int64(capacity))] = p[i]
+            }
+            written += Int64(n)
+        }
+        func slice(from a: Int64, to b: Int64) -> Data? {
+            let lo = max(a, written - Int64(capacity), 0), hi = min(b, written)
+            guard hi > lo else { return nil }
+            var out = [Int16](repeating: 0, count: Int(hi - lo))
+            for i in 0..<out.count { out[i] = buf[Int((lo + Int64(i)) % Int64(capacity))] }
+            return out.withUnsafeBufferPointer { Data(buffer: $0) }
+        }
     }
 
     enum Event: Sendable {
@@ -20,6 +49,7 @@ final class SpeechEngine: @unchecked Sendable {
         case error(String)
         case audioFile(URL)
         case sourceEnded
+        case engine(Kind)
     }
 
     let events: AsyncStream<Event>
@@ -42,6 +72,8 @@ final class SpeechEngine: @unchecked Sendable {
     private var lastLevelTime = Date.distantPast
     private var vad = PauseDetector()
     private var currentAnalyzer: SpeechAnalyzer?
+    private var ring = PCMRing(seconds: 120, rate: 16000)
+    private var epoch = 0
 
     private var analyzer: SpeechAnalyzer?
     private var resultsTask: Task<Void, Never>?
@@ -52,6 +84,9 @@ final class SpeechEngine: @unchecked Sendable {
     private var recordBaseName = "录音"
     private var recordPart = 0
     private var usingMic = false
+    /// 用户在设置里选的识别模型
+    var preferredEngine: ASREngine = .auto
+    private(set) var currentKind: Kind?
     private(set) var isRunning = false
 
     static let rotateSeconds: TimeInterval = 15 * 60
@@ -73,31 +108,47 @@ final class SpeechEngine: @unchecked Sendable {
 
     // MARK: 模型
 
-    static func makeModule(for lang: LectureLanguage) async -> DictationTranscriber? {
-        guard let loc = await DictationTranscriber.supportedLocale(equivalentTo: lang.locale) else { return nil }
-        return DictationTranscriber(locale: loc,
-                                    contentHints: [.farField],
-                                    transcriptionOptions: [.punctuation],
-                                    reportingOptions: [.volatileResults, .frequentFinalization],
-                                    attributeOptions: [.audioTimeRange])
+    enum Kind: String, Sendable {
+        case transcriber = "长语音模型"
+        case dictation = "听写模型"
     }
 
-    /// 检查（必要时下载）该语言的识别模型。返回 nil 表示可用，否则是给用户看的提示。
-    /// 注意：听写模型系统里已经装了时，AssetInventory.status 对新应用仍报 supported（没预留），
-    /// 但实际能直接用；所以先看 installedLocales，别去发下载请求（那个请求可能永远不返回）。
-    static func ensureModel(for lang: LectureLanguage) async -> String? {
-        guard let module = await makeModule(for: lang) else { return "系统不支持 \(lang.label) 识别" }
-        let wanted = Set(module.selectedLocales.map { $0.identifier(.bcp47) } + [lang.rawValue])
-        let installed = Set(await DictationTranscriber.installedLocales.map { $0.identifier(.bcp47) })
-        if !wanted.isDisjoint(with: installed) { return nil }
-        if await AssetInventory.status(forModules: [module]) == .installed { return nil }
-        if let req = try? await AssetInventory.assetInstallationRequest(supporting: [module]) {
-            // 下载有时一直没反应，最多等 3 分钟，超时后让它在后台继续
-            let ok = await race(timeout: 180) { (try? await req.downloadAndInstall()) != nil }
-            if ok { return nil }
+    /// 识别模块。优先用 SpeechTranscriber（长语音模型）：实测听写模型对真实会场的远场讲话完全不出字，
+    /// 只对贴近麦克风的清晰语音有效。长语音模型没装好的语言才退回听写模型。
+    static func makeModule(for lang: LectureLanguage, prefer: ASREngine = .auto) async -> (module: any SpeechModule, kind: Kind)? {
+        let id = lang.rawValue
+        let stInstalled = Set(await SpeechTranscriber.installedLocales.map { $0.identifier(.bcp47) })
+        let canST = SpeechTranscriber.isAvailable && stInstalled.contains(id)
+        if prefer != .dictation, canST, let loc = await SpeechTranscriber.supportedLocale(equivalentTo: lang.locale) {
+            let m = SpeechTranscriber(locale: loc, transcriptionOptions: [],
+                                      reportingOptions: [.volatileResults, .fastResults],
+                                      attributeOptions: [.audioTimeRange])
+            return (m, .transcriber)
         }
-        let after = Set(await DictationTranscriber.installedLocales.map { $0.identifier(.bcp47) })
-        if !wanted.isDisjoint(with: after) { return nil }
+        guard let loc = await DictationTranscriber.supportedLocale(equivalentTo: lang.locale) else { return nil }
+        let m = DictationTranscriber(locale: loc,
+                                     contentHints: [.farField],
+                                     transcriptionOptions: [.punctuation],
+                                     reportingOptions: [.volatileResults, .frequentFinalization],
+                                     attributeOptions: [.audioTimeRange])
+        return (m, .dictation)
+    }
+
+    /// 检查该语言有没有能用的识别模型。返回 nil 表示可用，否则是给用户看的提示。
+    /// 注意：模型系统里已经装了时，AssetInventory.status 对新应用仍报 supported（没预留），但实际能直接用；
+    /// 所以看 installedLocales。下载请求可能永远不返回，只在两种模型都没装时才试。
+    static func ensureModel(for lang: LectureLanguage) async -> String? {
+        let id = lang.rawValue
+        let st = Set(await SpeechTranscriber.installedLocales.map { $0.identifier(.bcp47) })
+        let dict = Set(await DictationTranscriber.installedLocales.map { $0.identifier(.bcp47) })
+        if st.contains(id) || dict.contains(id) { return nil }
+        if let loc = await SpeechTranscriber.supportedLocale(equivalentTo: lang.locale) {
+            let m = SpeechTranscriber(locale: loc, preset: .progressiveTranscription)
+            if let req = try? await AssetInventory.assetInstallationRequest(supporting: [m]) {
+                let ok = await race(timeout: 120) { (try? await req.downloadAndInstall()) != nil }
+                if ok { return nil }
+            }
+        }
         return "\(lang.label) 识别模型还没装好：打开 系统设置 › 键盘 › 听写，把「\(lang.label)」加进语言列表，等下载完再点开始。"
     }
 
@@ -205,8 +256,8 @@ final class SpeechEngine: @unchecked Sendable {
     }
 
     /// 讲座中途切换语言：音频和录音不停，只换识别器
-    func switchLanguage(_ lang: LectureLanguage) async {
-        guard isRunning, lang != language else { language = lang; return }
+    func switchLanguage(_ lang: LectureLanguage, force: Bool = false) async {
+        guard isRunning, lang != language || force else { language = lang; return }
         language = lang
         await finishAnalyzer()
         do {
@@ -214,6 +265,15 @@ final class SpeechEngine: @unchecked Sendable {
             if let f = lock.withLock({ inputFormat }) { setInputFormat(f) }
         } catch {
             eventSink.yield(.error("切换语言失败：\(error.localizedDescription)"))
+        }
+    }
+
+    /// 取一句话的原始音频（16 kHz 16 位 PCM），前后各多留 pad 秒
+    func pcm(for r: FinalResult, pad: Double = 0.3) -> Data? {
+        lock.withLock {
+            guard r.epoch == epoch else { return nil }
+            let rate = 16000.0
+            return ring.slice(from: Int64(max(0, r.audioStart - pad) * rate), to: Int64((r.audioEnd + pad) * rate))
         }
     }
 
@@ -238,7 +298,7 @@ final class SpeechEngine: @unchecked Sendable {
     // MARK: 识别器
 
     private func startAnalyzer(language: LectureLanguage) async throws {
-        guard let module = await Self.makeModule(for: language) else {
+        guard let (module, kind) = await Self.makeModule(for: language, prefer: preferredEngine) else {
             throw NSError(domain: "Lecture", code: 2, userInfo: [NSLocalizedDescriptionKey: "系统不支持 \(language.label) 识别"])
         }
         guard let format = await SpeechAnalyzer.bestAvailableAudioFormat(compatibleWith: [module]) else {
@@ -260,8 +320,12 @@ final class SpeechEngine: @unchecked Sendable {
             self.streamStartDate = nil
             self.currentAnalyzer = analyzer
             self.vad.reset(rate: format.sampleRate, language: language)
+            self.ring = PCMRing(seconds: 120, rate: format.sampleRate)
+            self.epoch += 1
         }
-        resultsTask = consume(module, analyzer: analyzer, language: language)
+        resultsTask = consume(module, analyzer: analyzer, language: language, epoch: lock.withLock { epoch })
+        currentKind = kind
+        eventSink.yield(.engine(kind))
     }
 
     private func finishAnalyzer() async {
@@ -281,16 +345,21 @@ final class SpeechEngine: @unchecked Sendable {
         eventSink.yield(.volatile(""))
     }
 
-    private func consume(_ module: DictationTranscriber, analyzer: SpeechAnalyzer, language: LectureLanguage) -> Task<Void, Never> {
+    private func consume(_ module: any SpeechModule, analyzer: SpeechAnalyzer, language: LectureLanguage, epoch: Int) -> Task<Void, Never> {
         Task { [weak self] in
+            func handle(_ text: AttributedString, _ range: CMTimeRange, _ isFinal: Bool) {
+                let txt = String(text.characters)
+                if Self.debug {
+                    print("[asr] final=\(isFinal) len=\(txt.count) range=\(String(format: "%.1f-%.1f", range.start.seconds, range.end.seconds)) tail=\(txt.suffix(40))")
+                }
+                self?.lock.withLock { self?.vad.pendingChars = isFinal ? 0 : txt.count }
+                self?.deliver(text: txt, range: range, isFinal: isFinal, language: language, epoch: epoch)
+            }
             do {
-                for try await r in module.results {
-                    let txt = String(r.text.characters)
-                    if Self.debug {
-                        print("[asr] final=\(r.isFinal) len=\(txt.count) range=\(String(format: "%.1f-%.1f", r.range.start.seconds, r.range.end.seconds)) tail=\(txt.suffix(40))")
-                    }
-                    self?.lock.withLock { self?.vad.pendingChars = r.isFinal ? 0 : txt.count }
-                    self?.deliver(text: txt, range: r.range, isFinal: r.isFinal, language: language)
+                if let m = module as? SpeechTranscriber {
+                    for try await r in m.results { handle(r.text, r.range, r.isFinal) }
+                } else if let m = module as? DictationTranscriber {
+                    for try await r in m.results { handle(r.text, r.range, r.isFinal) }
                 }
             } catch {
                 if !(error is CancellationError) { self?.eventSink.yield(.error("识别出错：\(error.localizedDescription)")) }
@@ -349,7 +418,7 @@ final class SpeechEngine: @unchecked Sendable {
         }
     }
 
-    private func deliver(text: String, range: CMTimeRange, isFinal: Bool, language: LectureLanguage) {
+    private func deliver(text: String, range: CMTimeRange, isFinal: Bool, language: LectureLanguage, epoch: Int) {
         guard isFinal else {
             eventSink.yield(.volatile(text))
             return
@@ -360,7 +429,9 @@ final class SpeechEngine: @unchecked Sendable {
         let dur = range.duration.isNumeric ? range.duration.seconds : 0
         eventSink.yield(.volatile(""))
         if !t.isEmpty, t.contains(where: { $0.isLetter || $0.isNumber }) {
-            eventSink.yield(.final(FinalResult(text: t, start: start, duration: dur, language: language)))
+            let a = range.start.isNumeric ? range.start.seconds : 0
+            eventSink.yield(.final(FinalResult(text: t, start: start, duration: dur, language: language,
+                                               audioStart: a, audioEnd: a + dur, epoch: epoch)))
         }
     }
 
@@ -390,6 +461,16 @@ final class SpeechEngine: @unchecked Sendable {
         }
         guard status != .error, out.frameLength > 0 else { return }
         cont?.yield(AnalyzerInput(buffer: out))
+        if fmt.sampleRate == 16000, fmt.channelCount == 1 {
+            if let p = out.int16ChannelData {
+                lock.withLock { ring.append(p[0], Int(out.frameLength)) }
+            } else if let f = out.floatChannelData {
+                let n = Int(out.frameLength)
+                var tmp = [Int16](repeating: 0, count: n)
+                for i in 0..<n { tmp[i] = Int16(max(-1, min(1, f[0][i])) * 32767) }
+                tmp.withUnsafeBufferPointer { bp in lock.withLock { ring.append(bp.baseAddress!, n) } }
+            }
+        }
         let db = Self.decibels(buffer)
         let (cut, an) = lock.withLock { (vad.feed(db: db, frames: out.frameLength), currentAnalyzer) }
         if let cut, let an {
@@ -466,10 +547,10 @@ final class SpeechEngine: @unchecked Sendable {
 
     // MARK: 文件识别（导入录音）
 
-    static func transcribeFile(_ url: URL, language: LectureLanguage, contextualStrings: [String], startDate: Date,
+    static func transcribeFile(_ url: URL, language: LectureLanguage, contextualStrings: [String], startDate: Date, prefer: ASREngine = .auto,
                                onFinal: @escaping @Sendable (FinalResult) async -> Void,
                                onProgress: (@Sendable (Double) async -> Void)? = nil) async throws {
-        guard let module = await makeModule(for: language) else {
+        guard let (module, _) = await makeModule(for: language, prefer: prefer) else {
             throw NSError(domain: "Lecture", code: 2, userInfo: [NSLocalizedDescriptionKey: "系统不支持 \(language.label) 识别"])
         }
         let file = try AVAudioFile(forReading: url)
@@ -480,13 +561,18 @@ final class SpeechEngine: @unchecked Sendable {
             ctx.contextualStrings[.general] = contextualStrings
             try? await analyzer.setContext(ctx)
         }
+        @Sendable func emit(_ text: AttributedString, _ range: CMTimeRange) async {
+            let t = String(text.characters).trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !t.isEmpty else { return }
+            let start = startDate.addingTimeInterval(range.start.isNumeric ? range.start.seconds : 0)
+            await onFinal(FinalResult(text: t, start: start, duration: range.duration.isNumeric ? range.duration.seconds : 0, language: language))
+            if total > 0, range.end.isNumeric { await onProgress?(min(1, range.end.seconds / total)) }
+        }
         let collector = Task {
-            for try await r in module.results where r.isFinal {
-                let t = String(r.text.characters).trimmingCharacters(in: .whitespacesAndNewlines)
-                guard !t.isEmpty else { continue }
-                let start = startDate.addingTimeInterval(r.range.start.isNumeric ? r.range.start.seconds : 0)
-                await onFinal(FinalResult(text: t, start: start, duration: r.range.duration.isNumeric ? r.range.duration.seconds : 0, language: language))
-                if total > 0, r.range.end.isNumeric { await onProgress?(min(1, r.range.end.seconds / total)) }
+            if let m = module as? SpeechTranscriber {
+                for try await r in m.results where r.isFinal { await emit(r.text, r.range) }
+            } else if let m = module as? DictationTranscriber {
+                for try await r in m.results where r.isFinal { await emit(r.text, r.range) }
             }
         }
         if let last = try await analyzer.analyzeSequence(from: file) {

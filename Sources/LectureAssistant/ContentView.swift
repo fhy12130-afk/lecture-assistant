@@ -18,7 +18,7 @@ struct ContentView: View {
             StatusBar()
         }
         .toolbar { toolbar }
-        .navigationTitle(store.title)
+        .navigationTitle(store.displayTitle)
         .fileImporter(isPresented: $importing, allowedContentTypes: [.audio, .mpeg4Audio, .wav, .aiff, .mp3]) { result in
             if case .success(let url) = result {
                 let access = url.startAccessingSecurityScopedResource()
@@ -156,6 +156,7 @@ struct BannerView: View {
         case .openDictationSettings: return "打开键盘设置"
         case .openSettings: return "打开设置"
         case .newSession: return "新建记录"
+        case .switchEngine: return "换识别模型"
         }
     }
 }
@@ -182,6 +183,9 @@ struct StatusBar: View {
                 Text("导入中 \(Int(p * 100))%")
             }
             Spacer()
+            if let k = store.asrKindName {
+                Text("识别：\(store.language.label) · \(k)\(store.localASRNames.isEmpty ? "" : " + " + store.localASRNames.joined(separator: "/"))")
+            }
             Text("笔记库 \(store.vaultDocCount) 篇")
             if let t = store.lastSavedAt {
                 Button {

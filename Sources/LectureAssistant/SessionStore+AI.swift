@@ -14,7 +14,12 @@ extension SessionStore {
 
     func makeContext() -> Assistant.Context {
         let d = settings.data
-        return Assistant.Context(title: title, speaker: speaker, myProfile: d.myProfile, speakerProfile: d.speakerProfile,
+        // 设置里的主讲人资料只在这场的汇报人就是那个人时才用，换了人就别张冠李戴
+        let profileName = d.speakerName.trimmingCharacters(in: .whitespaces)
+        let who = speaker.trimmingCharacters(in: .whitespaces)
+        let sameSpeaker = profileName.isEmpty || who.isEmpty || who.contains(profileName) || profileName.contains(who)
+        let speakerProfile = sameSpeaker ? d.speakerProfile : "这场的汇报人是 \(who)，没有更多资料（设置里的主讲人资料是 \(profileName) 的，不适用）。"
+        return Assistant.Context(title: displayTitle, speaker: who.isEmpty ? "（未知）" : who, myProfile: d.myProfile, speakerProfile: speakerProfile,
                                  pinnedNotes: pinnedCache, glossary: d.glossaryTerms, domain: d.domain, questionFocus: d.questionFocus)
     }
 
@@ -88,12 +93,14 @@ extension SessionStore {
                 guard let first = batch.first else { continue }
 
                 let prev = segments.filter { $0.time < first.time && $0.language == first.language }.suffix(3).map { s -> String in
-                    if let sec = s.secondary { return "\(s.text)\n→ \(sec)" }
-                    return s.text
+                    s.secondary ?? s.bestRaw
                 }
-                let items = batch.enumerated().map { Assistant.SecondaryItem(id: $0.offset + 1, text: $0.element.text) }
+                let items = batch.enumerated().map { off, seg in
+                    Assistant.SecondaryItem(id: off + 1, text: seg.text, alts: seg.localEngines ?? [:])
+                }
+                let topic = (title.isEmpty ? "" : "题目：\(title)\n") + String(overallSummary.prefix(600))
                 do {
-                    let res = try await Assistant.secondary(items, language: first.language, previous: Array(prev),
+                    let res = try await Assistant.secondary(items, language: first.language, previous: Array(prev), topic: topic,
                                                             ctx: makeContext(), client: client, model: settings.data.fastModel)
                     for (i, seg) in batch.enumerated() {
                         if let v = res[i + 1]?.trimmingCharacters(in: .whitespacesAndNewlines), !v.isEmpty {
@@ -165,6 +172,7 @@ extension SessionStore {
                 lastSummaryAt = Date()
                 noteAPI(nil)
                 scheduleSave()
+                if titleIsAuto || speakerIsAuto { Task { await proposeTitle(force: false) } }
             } catch {
                 noteAPI(error)
                 lastSummaryAt = Date()   // 失败了也等下一个周期再试，别连续刷
@@ -296,6 +304,62 @@ extension SessionStore {
     }
 
     private func appendQuestion(_ id: UUID, _ t: String) { updateQuestion(id) { $0.content += t } }
+
+    // MARK: 拟题目
+
+    /// 内容够了就让 AI 拟题目；只覆盖还没被手动改过的标题/汇报人
+    func maybeProposeTitle() {
+        guard titleIsAuto || speakerIsAuto, !isProposingTitle else { return }
+        let chars = segments.reduce(0) { $0 + $1.text.count }
+        let thresholds = [200, 1200]
+        guard titleRequestCount < thresholds.count, chars >= thresholds[titleRequestCount] else { return }
+        titleRequestCount += 1
+        Task { await proposeTitle(force: false) }
+    }
+
+    /// force：用户点了“AI 拟题”，结果直接用上
+    func proposeTitle(force: Bool) async {
+        guard !isProposingTitle, !segments.isEmpty, let client = makeClient() else {
+            if segments.isEmpty, force { flash("还没有转写内容，没法拟题目") }
+            return
+        }
+        isProposingTitle = true
+        defer { isProposingTitle = false }
+        var excerpt = ""
+        for s in segments {
+            excerpt += s.bestChinese + "\n"
+            if excerpt.count > 3500 { break }
+        }
+        if segments.count > 40 {
+            excerpt += "……\n" + segments.suffix(15).map(\.bestChinese).joined(separator: "\n")
+        }
+        let req = Assistant.titleRequest(excerpt: excerpt, overall: overallSummary, currentTitle: title, currentSpeaker: speaker,
+                                         ctx: makeContext(), model: settings.data.fastModel)
+        guard let r = try? await client.complete(req, timeout: 30),
+              let data = LLMClient.extractJSON(r.text, open: "{", close: "}"),
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            if force { flash("拟题目失败，稍后再试") }
+            return
+        }
+        let newTitle = (obj["title"] as? String ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        let newSpeaker = (obj["speaker"] as? String ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        var changed: [String] = []
+        if !newTitle.isEmpty, force || titleIsAuto, newTitle != title {
+            title = newTitle
+            titleIsAuto = true
+            changed.append("题目「\(newTitle)」")
+        }
+        if !newSpeaker.isEmpty, force || speakerIsAuto, newSpeaker != speaker {
+            speaker = newSpeaker
+            changed.append("汇报人「\(newSpeaker)」")
+        }
+        if !changed.isEmpty {
+            flash("AI 拟了\(changed.joined(separator: "、"))，左上角可以直接改")
+            scheduleSave()
+        } else if force {
+            flash("AI 觉得现在的题目就合适")
+        }
+    }
 
     // MARK: 连接测试
 

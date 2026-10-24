@@ -12,6 +12,18 @@ enum KeyMode: String, Codable, CaseIterable, Identifiable {
     var id: String { rawValue }
 }
 
+enum ASREngine: String, Codable, CaseIterable, Identifiable, Sendable {
+    case auto, transcriber, dictation
+    var id: String { rawValue }
+    var label: String {
+        switch self {
+        case .auto: return "自动（推荐：有长语音模型就用它）"
+        case .transcriber: return "长语音模型 SpeechTranscriber"
+        case .dictation: return "听写模型 DictationTranscriber"
+        }
+    }
+}
+
 enum Effort: String, Codable, CaseIterable, Identifiable {
     case low, medium, high
     var id: String { rawValue }
@@ -40,6 +52,8 @@ struct SettingsData: Codable, Equatable {
     var sessionTitle = "未命名讲座"
     var speakerName = ""
     var domain = ""                   // 讲座领域，翻译和纠错时参考
+    var asrEngine: ASREngine = .auto
+    var localASR = true               // 本地第二引擎复核每一句（装了才生效）
     var autoSecondary = true          // 英文自动翻译 / 中文自动校正
     var summaryIntervalMin = 4
     var recordAudio = true

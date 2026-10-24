@@ -19,6 +19,10 @@ final class SessionStore {
     var myNotes = ""
     var markdownPath: String?
     var lastSummarizedSegmentID: UUID?
+    /// 标题 / 汇报人还是自动的（没被手动改过），AI 可以根据内容更新
+    var titleIsAuto = true
+    var speakerIsAuto = true
+    var isProposingTitle = false
 
     // MARK: 实时状态
     var volatileText = ""
@@ -43,6 +47,8 @@ final class SessionStore {
     var recordedSeconds: TimeInterval = 0
     var sideTab: SideTab = .summary
     var language: LectureLanguage
+    var asrKindName: String?
+    var localASRNames: [String] = []
 
     enum SideTab: String, CaseIterable, Identifiable {
         case summary = "摘要", qa = "疑问", questions = "提问", notes = "笔记"
@@ -54,7 +60,7 @@ final class SessionStore {
         var text: String
         var isError: Bool
         var action: Action?
-        enum Action: Equatable { case openMicSettings, openDictationSettings, openSettings, newSession }
+        enum Action: Equatable { case openMicSettings, openDictationSettings, openSettings, newSession, switchEngine }
     }
 
     // MARK: 内部
@@ -75,14 +81,19 @@ final class SessionStore {
     @ObservationIgnored var audioDirOverride: URL?
     /// 演示数据：不写崩溃恢复快照
     @ObservationIgnored var isDemo = false
+    @ObservationIgnored var lastASRActivity: Date?
+    @ObservationIgnored var lastLoud: Date?
+    @ObservationIgnored var watchdogWarned = false
+    @ObservationIgnored var titleRequestCount = 0
 
     static var snapshotURL: URL { AppSettings.appSupportURL.appendingPathComponent("current-session.json") }
 
     init(restore: Bool = true) {
         let d = AppSettings.shared.data
-        title = d.sessionTitle
+        title = d.sessionTitle.trimmingCharacters(in: .whitespaces)
         speaker = d.speakerName
         language = d.language
+        titleIsAuto = title.isEmpty
         if restore { restoreSnapshot() }
         eventsTask = Task { [weak self] in
             guard let events = self?.engine.events else { return }
@@ -91,10 +102,19 @@ final class SessionStore {
                 self.handle(ev)
             }
         }
-        timer = Timer.scheduledTimer(withTimeInterval: 20, repeats: true) { [weak self] _ in
-            Task { @MainActor in self?.summarizeIfDue() }
+        timer = Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { [weak self] _ in
+            Task { @MainActor in
+                self?.summarizeIfDue()
+                self?.checkWatchdog()
+            }
         }
         Task { await reindexVault() }
+        Task { await startLocalASR() }
+    }
+
+    func startLocalASR() async {
+        guard settings.data.localASR, LocalASR.isInstalled else { localASRNames = []; return }
+        localASRNames = await LocalASR.shared.start()
     }
 
     // MARK: 录音
@@ -124,11 +144,14 @@ final class SessionStore {
         if let dir = recordDir, (try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)) == nil {
             recordDir = AppSettings.appSupportURL.appendingPathComponent("讲座录音", isDirectory: true)
         }
+        engine.preferredEngine = d.asrEngine
         do {
             try await engine.start(language: language, contextualStrings: d.glossaryTerms,
-                                   recordDir: recordDir, recordBaseName: fileBaseName)
+                                   recordDir: recordDir, recordBaseName: audioBaseName)
             isRecording = true
             recordingSince = Date()
+            lastASRActivity = Date()
+            watchdogWarned = false
             if lastSummaryAt == nil { lastSummaryAt = Date() }
             // 录音期间不让系统睡眠、不进 App Nap（合盖仍会睡）
             sleepActivity = ProcessInfo.processInfo.beginActivity(options: [.idleSystemSleepDisabled, .userInitiated], reason: "正在记录讲座")
@@ -142,9 +165,10 @@ final class SessionStore {
     func startSimulated(_ url: URL, speed: Double) async {
         guard !isRecording else { return }
         let d = settings.data
+        engine.preferredEngine = d.asrEngine
         do {
             try await engine.startSimulated(file: url, speed: speed, language: language, contextualStrings: d.glossaryTerms,
-                                            recordDir: d.recordAudio ? (audioDirOverride ?? d.audioURL) : nil, recordBaseName: fileBaseName)
+                                            recordDir: d.recordAudio ? (audioDirOverride ?? d.audioURL) : nil, recordBaseName: audioBaseName)
             isRecording = true
             recordingSince = Date()
             if lastSummaryAt == nil { lastSummaryAt = Date() }
@@ -182,9 +206,17 @@ final class SessionStore {
 
     private func handle(_ ev: SpeechEngine.Event) {
         switch ev {
-        case .volatile(let t): volatileText = t
-        case .final(let r): addFinal(r)
-        case .level(let l): level = l
+        case .volatile(let t):
+            volatileText = t
+            if !t.isEmpty { lastASRActivity = Date() }
+        case .final(let r):
+            lastASRActivity = Date()
+            addFinal(r)
+        case .level(let l):
+            level = l
+            if l > 0.45 { lastLoud = Date() }
+        case .engine(let k):
+            asrKindName = k.rawValue
         case .error(let msg): show(msg, error: true)
         case .audioFile(let url):
             if !audioFiles.contains(url.lastPathComponent) { audioFiles.append(url.lastPathComponent) }
@@ -196,6 +228,7 @@ final class SessionStore {
 
     func addFinal(_ r: SpeechEngine.FinalResult) {
         let seg = Segment(time: r.start, duration: r.duration, text: r.text, language: r.language)
+        let pcm = settings.data.localASR && !localASRNames.isEmpty ? engine.pcm(for: r) : nil
         if let last = segments.last, last.time > seg.time {
             // 导入的录音时间可能早于已有内容
             let idx = segments.firstIndex { $0.time > seg.time } ?? segments.endIndex
@@ -203,8 +236,50 @@ final class SessionStore {
         } else {
             segments.append(seg)
         }
-        if settings.data.autoSecondary { enqueueSecondary([seg.id]) }
+        if let pcm {
+            // 本地引擎复核这一句，拿到结果再交给 AI 综合
+            let id = seg.id, lang = r.language
+            Task {
+                if let res = await LocalASR.shared.recognize(pcm, language: lang) {
+                    if let i = segments.firstIndex(where: { $0.id == id }) {
+                        segments[i].localText = res.text
+                        segments[i].localEngines = res.engines
+                    }
+                } else if !(await LocalASR.shared.isReady) {
+                    localASRNames = []
+                }
+                if settings.data.autoSecondary { enqueueSecondary([id]) }
+                scheduleSave()
+            }
+        } else if settings.data.autoSecondary {
+            enqueueSecondary([seg.id])
+        }
+        maybeProposeTitle()
         scheduleSave()
+    }
+
+    // MARK: 识别看门狗
+
+    /// 有声音却很久没出字：多半是语言选错或者识别模型不适合，提示换一个
+    func checkWatchdog() {
+        guard isRecording, !watchdogWarned, let since = lastASRActivity ?? recordingSince else { return }
+        let now = Date()
+        guard now.timeIntervalSince(since) > 25, let loud = lastLoud, now.timeIntervalSince(loud) < 10 else { return }
+        watchdogWarned = true
+        show("有声音，但 25 秒没识别出文字（当前：\(language.label) · \(asrKindName ?? "识别模型")）。先确认讲座语言选对了；还不行就点右边换一个识别模型。", error: true, action: .switchEngine)
+    }
+
+    func switchEngine() {
+        let next: ASREngine = engine.currentKind == .dictation ? .transcriber : .dictation
+        settings.data.asrEngine = next
+        engine.preferredEngine = next
+        guard isRecording else { flash("已改用\(next.label)"); return }
+        Task {
+            await engine.switchLanguage(language, force: true)
+            lastASRActivity = Date()
+            watchdogWarned = false
+            flash("已换成\(asrKindName ?? next.label)")
+        }
     }
 
     // MARK: 导入录音
@@ -219,6 +294,7 @@ final class SessionStore {
         let base = (try? url.resourceValues(forKeys: [.creationDateKey]).creationDate) ?? Date()
         do {
             try await SpeechEngine.transcribeFile(url, language: language, contextualStrings: settings.data.glossaryTerms, startDate: base,
+                prefer: settings.data.asrEngine,
                 onFinal: { [weak self] r in await self?.addFinal(r) },
                 onProgress: { [weak self] p in await self?.setImportProgress(p) })
             flash("导入完成：\(url.lastPathComponent)")
@@ -245,8 +321,11 @@ final class SessionStore {
         saveNow()
         let d = settings.data
         sessionID = UUID()
-        title = d.sessionTitle
+        title = d.sessionTitle.trimmingCharacters(in: .whitespaces)
+        titleIsAuto = title.isEmpty
         speaker = d.speakerName
+        speakerIsAuto = true
+        titleRequestCount = 0
         startedAt = Date()
         segments = []
         summaries = []
@@ -266,15 +345,25 @@ final class SessionStore {
         flash("已开始新的记录")
     }
 
+    var displayTitle: String { title.isEmpty ? "未命名讲座" : title }
+
     var fileBaseName: String {
-        let safe = title.replacingOccurrences(of: "/", with: "-").replacingOccurrences(of: ":", with: "-")
-        return "\(Fmt.fileStamp.string(from: startedAt)) \(safe)"
+        let safe = displayTitle.replacingOccurrences(of: "/", with: "-").replacingOccurrences(of: ":", with: "-")
+        return "\(Fmt.fileStamp.string(from: startedAt)) \(String(safe.prefix(60)))"
+    }
+
+    /// 录音文件名不带标题（标题可能之后才定）
+    var audioBaseName: String { "\(Fmt.fileStamp.string(from: startedAt)) 讲座录音" }
+
+    /// 按当前标题应有的路径；标题改了，保存时会把旧文件改名
+    var desiredMarkdownURL: URL {
+        let dir = notesDirOverride ?? settings.data.notesURL
+        return dir.appendingPathComponent(fileBaseName + ".md")
     }
 
     var markdownURL: URL {
         if let p = markdownPath { return URL(fileURLWithPath: p) }
-        let dir = notesDirOverride ?? settings.data.notesURL
-        return dir.appendingPathComponent(fileBaseName + ".md")
+        return desiredMarkdownURL
     }
 
     func snapshot() -> LectureSession {
@@ -288,6 +377,8 @@ final class SessionStore {
         s.markdownPath = markdownPath
         s.myNotes = myNotes
         s.lastSummarizedSegmentID = lastSummarizedSegmentID
+        s.titleIsAuto = titleIsAuto
+        s.speakerIsAuto = speakerIsAuto
         return s
     }
 
@@ -309,6 +400,8 @@ final class SessionStore {
         markdownPath = s.markdownPath
         myNotes = s.myNotes
         lastSummarizedSegmentID = s.lastSummarizedSegmentID
+        titleIsAuto = s.titleIsAuto ?? false
+        speakerIsAuto = s.speakerIsAuto ?? false
         lastSummaryAt = s.summaries.last?.createdAt
         banner = Banner(text: "已恢复上次的记录「\(s.title)」（\(Fmt.hm(s.startedAt)) 开始，\(s.segments.count) 句）。要记新讲座就点右边新建。", isError: false, action: .newSession)
     }
@@ -330,6 +423,15 @@ final class SessionStore {
     func saveNow() {
         let snap = snapshot()
         guard !snap.isEmpty else { return }
+        // 标题改了：写到新文件名，删掉旧的（只在同一个文件夹里改名）
+        var oldToRemove: URL?
+        if let p = markdownPath {
+            let old = URL(fileURLWithPath: p), want = desiredMarkdownURL
+            if old != want, old.deletingLastPathComponent() == want.deletingLastPathComponent() {
+                oldToRemove = old
+                markdownPath = nil
+            }
+        }
         let url = markdownURL
         let md = MarkdownExporter.render(snap, vaultURL: settings.data.vaultURL)
         let json = isDemo ? nil : try? JSONEncoder().encode(snap)
@@ -344,6 +446,7 @@ final class SessionStore {
                 try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
                 try md.write(to: url, atomically: true, encoding: .utf8)
                 written = url
+                if let old = oldToRemove { try? FileManager.default.removeItem(at: old) }
             } catch {
                 err = error.localizedDescription
                 if (try? FileManager.default.createDirectory(at: fallback.deletingLastPathComponent(), withIntermediateDirectories: true)) != nil,
@@ -454,6 +557,8 @@ final class SessionStore {
             NSApp.sendAction(Selector(("showSettingsWindow:")), to: nil, from: nil)
         case .newSession:
             Task { await newSession() }
+        case .switchEngine:
+            switchEngine()
         }
     }
 }

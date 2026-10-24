@@ -11,7 +11,7 @@ enum MarkdownExporter {
         tags: [type/讲座, context/research]
         generated_by: 讲座助手
         ---
-        # \(s.title)
+        # \(s.title.isEmpty ? "未命名讲座" : s.title)
 
         - 时间：\(Fmt.day.string(from: begin)) \(Fmt.hm(begin))\(s.segments.last.map { "–" + Fmt.hm($0.time.addingTimeInterval($0.duration)) } ?? "")
         - 主讲：\(s.speaker)
@@ -64,9 +64,12 @@ enum MarkdownExporter {
 
         md += "\n## 完整转写\n\n"
         for seg in s.segments {
-            md += "**[\(Fmt.clock(seg.time))]** \(seg.text)\n"
-            if let sec = seg.secondary, !sec.isEmpty, sec != seg.text {
-                md += seg.language == .english ? "> \(sec)\n" : "> 校正：\(sec)\n"
+            if seg.language == .english {
+                md += "**[\(Fmt.clock(seg.time))]** \(seg.bestRaw)\n"
+                if let sec = seg.secondary, !sec.isEmpty { md += "> \(sec)\n" }
+            } else {
+                md += "**[\(Fmt.clock(seg.time))]** \(seg.bestChinese)\n"
+                if seg.secondary != nil, seg.bestRaw != seg.bestChinese { md += "> 识别原文：\(seg.bestRaw)\n" }
             }
             md += "\n"
         }

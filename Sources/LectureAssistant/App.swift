@@ -21,6 +21,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         Task { @MainActor in
             await store.stop()
             store.flushSaves()
+            await LocalASR.shared.stop()
             NSApp.reply(toApplicationShouldTerminate: true)
         }
         return .terminateLater
