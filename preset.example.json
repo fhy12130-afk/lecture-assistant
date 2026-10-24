@@ -1,0 +1,15 @@
+{
+  "sessionTitle": "Physics-informed neural networks for structural computing",
+  "speakerName": "Prof. Example",
+  "domain": "计算力学、科学机器学习、有限元",
+  "myProfile": "我是土木工程硕士二年级学生，研究方向是用有限元数据训练图神经网络代理模型。目标是申请计算力学 / 科学机器学习方向的博士。",
+  "speakerProfile": "主讲人是某大学土木系助理教授，做物理信息神经网络（PINN）和神经算子替代有限元。代表作：……（写清楚哪些论文他是一作或通讯）",
+  "questionFocus": "强非线性和材料破坏、自回归 rollout 的误差累积、未见工况的泛化",
+  "pinnedNotes": "Projects/My research/README.md\nTalks/lecture-prep.md",
+  "glossary": "PINN\nneural operator\nfinite element\n有限元\n神经算子",
+  "apiBaseURL": "https://api.anthropic.com",
+  "keyFilePath": "~/.config/lecture-assistant/key",
+  "notesFolder": "讲座记录",
+  "audioFolder": "讲座记录/录音",
+  "summaryIntervalMin": 4
+}
