@@ -16,6 +16,7 @@ final class SessionStore {
     var qas: [QAItem] = []
     var questionSets: [QuestionSet] = []
     var audioFiles: [String] = []
+    var audioParts: [AudioPart] = []
     var myNotes = ""
     var markdownPath: String?
     var lastSummarizedSegmentID: UUID?
@@ -65,6 +66,9 @@ final class SessionStore {
 
     // MARK: 内部
     @ObservationIgnored let settings = AppSettings.shared
+    @ObservationIgnored let player = AudioPlayback()
+    var showLibrary = false
+    var editingSegmentID: UUID?
     @ObservationIgnored let engine = SpeechEngine()
     @ObservationIgnored let vault = VaultSearch()
     @ObservationIgnored var secondaryQueue: [UUID] = []
@@ -186,6 +190,7 @@ final class SessionStore {
         recordingSince = nil
         level = 0
         saveNow()
+        player.refreshDurations()
     }
 
     func setLanguage(_ lang: LectureLanguage) {
@@ -219,7 +224,11 @@ final class SessionStore {
             asrKindName = k.rawValue
         case .error(let msg): show(msg, error: true)
         case .audioFile(let url):
-            if !audioFiles.contains(url.lastPathComponent) { audioFiles.append(url.lastPathComponent) }
+            if !audioFiles.contains(url.lastPathComponent) {
+                audioFiles.append(url.lastPathComponent)
+                audioParts.append(AudioPart(name: url.lastPathComponent, start: Date()))
+                reloadAudio()
+            }
             scheduleSave()
         case .sourceEnded:
             Task { await stop() }
@@ -318,7 +327,8 @@ final class SessionStore {
 
     func newSession() async {
         if isRecording { await stop() }
-        saveNow()
+        flushSaves()        // 等旧记录写完再清状态
+        player.stop()
         let d = settings.data
         sessionID = UUID()
         title = d.sessionTitle.trimmingCharacters(in: .whitespaces)
@@ -333,6 +343,8 @@ final class SessionStore {
         qas = []
         questionSets = []
         audioFiles = []
+        audioParts = []
+        player.load(parts: [], files: [], resolve: { _ in nil })
         myNotes = ""
         markdownPath = nil
         lastSummarizedSegmentID = nil
@@ -341,7 +353,7 @@ final class SessionStore {
         selected = []
         volatileText = ""
         secondaryQueue = []
-        try? FileManager.default.removeItem(at: Self.snapshotURL)
+        if !isDemo { try? FileManager.default.removeItem(at: Self.snapshotURL) }
         flash("已开始新的记录")
     }
 
@@ -379,6 +391,7 @@ final class SessionStore {
         s.lastSummarizedSegmentID = lastSummarizedSegmentID
         s.titleIsAuto = titleIsAuto
         s.speakerIsAuto = speakerIsAuto
+        s.audioParts = audioParts
         return s
     }
 
@@ -386,6 +399,12 @@ final class SessionStore {
         guard let data = try? Data(contentsOf: Self.snapshotURL),
               let s = try? JSONDecoder().decode(LectureSession.self, from: data),
               !s.isEmpty, Date().timeIntervalSince(s.startedAt) < 36 * 3600 else { return }
+        apply(s)
+        banner = Banner(text: "已恢复上次的记录「\(displayTitle)」（\(Fmt.hm(s.startedAt)) 开始，\(s.segments.count) 句）。要记新讲座就点右边新建。", isError: false, action: .newSession)
+    }
+
+    /// 把一份记录载入到界面
+    func apply(_ s: LectureSession) {
         sessionID = s.id
         title = s.title
         speaker = s.speaker
@@ -397,13 +416,97 @@ final class SessionStore {
         qas = s.qas.map { var q = $0; if q.status == .running { q.status = .failed; q.error = q.error ?? "应用重启，回答中断" }; return q }
         questionSets = s.questionSets.map { var q = $0; if q.status == .running { q.status = .failed; q.error = q.error ?? "应用重启，生成中断" }; return q }
         audioFiles = s.audioFiles
+        audioParts = s.audioParts ?? []
         markdownPath = s.markdownPath
         myNotes = s.myNotes
-        lastSummarizedSegmentID = s.lastSummarizedSegmentID
+        lastSummarizedSegmentID = s.lastSummarizedSegmentID ?? (s.summaries.isEmpty ? nil : s.segments.last?.id)
         titleIsAuto = s.titleIsAuto ?? false
         speakerIsAuto = s.speakerIsAuto ?? false
         lastSummaryAt = s.summaries.last?.createdAt
-        banner = Banner(text: "已恢复上次的记录「\(s.title)」（\(Fmt.hm(s.startedAt)) 开始，\(s.segments.count) 句）。要记新讲座就点右边新建。", isError: false, action: .newSession)
+        recordedSeconds = 0
+        recordingSince = nil
+        selected = []
+        volatileText = ""
+        secondaryQueue = []
+        titleRequestCount = 2
+        reloadAudio()
+    }
+
+    // MARK: 回放
+
+    func resolveAudio(_ name: String) -> URL? {
+        if name.hasPrefix("/") { return URL(fileURLWithPath: name) }
+        let candidates = [audioDirOverride ?? settings.data.audioURL,
+                          AppSettings.appSupportURL.appendingPathComponent("讲座录音", isDirectory: true)]
+        for d in candidates {
+            let u = d.appendingPathComponent(name)
+            if FileManager.default.fileExists(atPath: u.path) { return u }
+        }
+        return nil
+    }
+
+    func reloadAudio() {
+        player.load(parts: audioParts, files: audioFiles, resolve: resolveAudio)
+    }
+
+    func playFrom(_ seg: Segment) {
+        if player.parts.isEmpty || player.parts.contains(where: { $0.duration == nil }) { reloadAudio() }
+        player.play(at: seg.time)
+        if let m = player.message { flash(m) }
+    }
+
+    // MARK: 修改
+
+    func updateSegment(_ id: UUID, text: String?, secondary: String?) {
+        guard let i = segments.firstIndex(where: { $0.id == id }) else { return }
+        if let t = text { segments[i].text = t; segments[i].localText = nil; segments[i].localEngines = nil }
+        if let s = secondary { segments[i].secondary = s; segments[i].secondaryFailed = false }
+        scheduleSave()
+    }
+
+    func deleteSegment(_ id: UUID) {
+        segments.removeAll { $0.id == id }
+        selected.remove(id)
+        scheduleSave()
+    }
+
+    func deleteQA(_ id: UUID) { qas.removeAll { $0.id == id }; scheduleSave() }
+    func deleteQuestionSet(_ id: UUID) { questionSets.removeAll { $0.id == id }; scheduleSave() }
+    func deleteSummary(_ id: UUID) { summaries.removeAll { $0.id == id }; scheduleSave() }
+
+    // MARK: 记录列表
+
+    func listRecords() -> [RecordInfo] {
+        RecordLibrary.list(folders: [notesDirOverride ?? settings.data.notesURL, Self.fallbackNotesURL])
+    }
+
+    // MARK: 记录库
+
+    /// 每场记录的完整数据单独存一份，回看时用（Markdown 只是给人看的）
+    static var archiveDir: URL {
+        let d = AppSettings.appSupportURL.appendingPathComponent("sessions", isDirectory: true)
+        try? FileManager.default.createDirectory(at: d, withIntermediateDirectories: true)
+        return d
+    }
+
+    static func archiveURL(_ id: UUID) -> URL { archiveDir.appendingPathComponent(id.uuidString + ".json") }
+
+    /// 打开一份以前的记录。录音中不能切换。
+    func open(_ record: RecordInfo) async -> Bool {
+        if isRecording {
+            show("正在录音，先停止再打开别的记录。", error: true)
+            return false
+        }
+        guard record.mdURL?.path != markdownURL.path || record.sessionID != sessionID else { return true }
+        flushSaves()
+        guard let s = RecordLibrary.load(record) else {
+            show("打不开这份记录：\(record.title)", error: true)
+            return false
+        }
+        apply(s)
+        if !isDemo, let json = try? JSONEncoder().encode(s) { try? json.write(to: Self.snapshotURL, options: .atomic) }
+        flash("已打开「\(displayTitle)」（\(s.segments.count) 句）。可以接着提问、修改，或者点开始继续记录。")
+        return true
     }
 
     // MARK: 保存
@@ -423,11 +526,15 @@ final class SessionStore {
     func saveNow() {
         let snap = snapshot()
         guard !snap.isEmpty else { return }
-        // 标题改了：写到新文件名，删掉旧的（只在同一个文件夹里改名）
+        let sid = sessionID
+        // 标题改了：写到新文件名，旧文件移到废纸篓。只动属于这场记录的文件
+        // （同一文件夹、文件名以这场的开始时间开头），绝不碰别的记录。
         var oldToRemove: URL?
         if let p = markdownPath {
             let old = URL(fileURLWithPath: p), want = desiredMarkdownURL
-            if old != want, old.deletingLastPathComponent() == want.deletingLastPathComponent() {
+            let stamp = Fmt.fileStamp.string(from: startedAt) + " "
+            if old != want, old.deletingLastPathComponent() == want.deletingLastPathComponent(),
+               old.lastPathComponent.hasPrefix(stamp) {
                 oldToRemove = old
                 markdownPath = nil
             }
@@ -436,17 +543,21 @@ final class SessionStore {
         let md = MarkdownExporter.render(snap, vaultURL: settings.data.vaultURL)
         let json = isDemo ? nil : try? JSONEncoder().encode(snap)
         let snapshotURL = Self.snapshotURL
+        let archiveURL = Self.archiveURL(sid)
         let fallback = Self.fallbackNotesURL.appendingPathComponent(url.lastPathComponent)
         // 写文件放后台：首次访问“文稿”目录时系统弹权限框，会卡住调用线程
         saveQueue.async { [weak self] in
             var written: URL?
             var err: String?
-            if let json { try? json.write(to: snapshotURL, options: .atomic) }
+            if let json {
+                try? json.write(to: snapshotURL, options: .atomic)
+                try? json.write(to: archiveURL, options: .atomic)
+            }
             do {
                 try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
                 try md.write(to: url, atomically: true, encoding: .utf8)
                 written = url
-                if let old = oldToRemove { try? FileManager.default.removeItem(at: old) }
+                if let old = oldToRemove, old != url { try? FileManager.default.trashItem(at: old, resultingItemURL: nil) }
             } catch {
                 err = error.localizedDescription
                 if (try? FileManager.default.createDirectory(at: fallback.deletingLastPathComponent(), withIntermediateDirectories: true)) != nil,
@@ -455,7 +566,8 @@ final class SessionStore {
                 }
             }
             Task { @MainActor [weak self] in
-                guard let self else { return }
+                // 已经新建了别的记录：这次保存的结果不能再写回当前记录的状态
+                guard let self, self.sessionID == sid else { return }
                 if let w = written {
                     if self.markdownPath == nil || w == fallback { self.markdownPath = w.path }
                     self.lastSavedAt = Date()
@@ -498,7 +610,10 @@ final class SessionStore {
     }
 
     func openVaultNote(_ rel: String) {
-        let url = settings.data.vaultURL.appendingPathComponent(rel)
+        openFileInObsidian(settings.data.vaultURL.appendingPathComponent(rel))
+    }
+
+    func openFileInObsidian(_ url: URL) {
         var comps = URLComponents()
         comps.scheme = "obsidian"
         comps.host = "open"

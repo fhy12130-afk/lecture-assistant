@@ -10,6 +10,7 @@ enum MarkdownExporter {
         speaker: \(s.speaker)
         tags: [type/讲座, context/research]
         generated_by: 讲座助手
+        session_id: \(s.id.uuidString)
         ---
         # \(s.title.isEmpty ? "未命名讲座" : s.title)
 

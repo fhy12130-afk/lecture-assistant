@@ -18,6 +18,9 @@ struct ContentView: View {
             StatusBar()
         }
         .toolbar { toolbar }
+        .sheet(isPresented: Binding(get: { store.showLibrary }, set: { store.showLibrary = $0 })) {
+            LibraryView()
+        }
         .navigationTitle(store.displayTitle)
         .fileImporter(isPresented: $importing, allowedContentTypes: [.audio, .mpeg4Audio, .wav, .aiff, .mp3]) { result in
             if case .success(let url) = result {
@@ -51,6 +54,12 @@ struct ContentView: View {
             .help("讲座用什么语言。英文会自动翻译成中文；录音中途也可以切换")
         }
         ToolbarItemGroup(placement: .primaryAction) {
+            Button {
+                store.showLibrary = true
+            } label: {
+                Label("记录", systemImage: "books.vertical")
+            }
+            .help("所有讲座记录：打开以前的回看、提问、修改（⌘L）")
             Button {
                 Task { await store.summarize() }
             } label: {

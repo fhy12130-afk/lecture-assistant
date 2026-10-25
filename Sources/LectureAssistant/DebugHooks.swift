@@ -82,20 +82,8 @@ extension SessionStore {
         guard let data = try? Data(contentsOf: url), let s = try? JSONDecoder().decode(LectureSession.self, from: data) else { return }
         isDemo = true
         notesDirOverride = URL(fileURLWithPath: "/tmp/lecture-demo", isDirectory: true)
-        sessionID = s.id
-        title = s.title
-        speaker = s.speaker
-        titleIsAuto = s.titleIsAuto ?? false
-        startedAt = s.startedAt
-        segments = s.segments
-        summaries = s.summaries
-        overallSummary = s.overallSummary
-        qas = s.qas
-        questionSets = s.questionSets
-        audioFiles = s.audioFiles
-        myNotes = s.myNotes
+        apply(s)
         markdownPath = nil
-        lastSummarizedSegmentID = s.lastSummarizedSegmentID
         volatileText = "接下来我想给大家看一个具体的例子，就是车桥耦合振动的"
         recordedSeconds = 1234
     }

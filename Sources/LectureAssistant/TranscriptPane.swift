@@ -8,6 +8,11 @@ struct TranscriptPane: View {
 
     var body: some View {
         @Bindable var store = store
+        VStack(spacing: 0) {
+        if !store.audioFiles.isEmpty {
+            PlayerBar()
+            Divider()
+        }
         ZStack(alignment: .bottom) {
             ScrollViewReader { proxy in
                 ScrollView {
@@ -16,9 +21,11 @@ struct TranscriptPane: View {
                         if store.segments.isEmpty && store.volatileText.isEmpty {
                             emptyHint
                         }
+                        let playingID = playingSegmentID
                         ForEach(store.segments) { seg in
                             SegmentRow(segment: seg,
                                        isSelected: store.selected.contains(seg.id),
+                                       isPlaying: seg.id == playingID,
                                        fontSize: settings.data.fontSize,
                                        autoSecondary: settings.data.autoSecondary)
                                 .id(seg.id)
@@ -61,7 +68,18 @@ struct TranscriptPane: View {
                 selectionBar
             }
         }
+        }
         .background(Color(nsColor: .textBackgroundColor))
+        .sheet(item: Binding(get: { store.editingSegmentID.flatMap { id in store.segments.first { $0.id == id } } },
+                             set: { store.editingSegmentID = $0?.id })) { seg in
+            SegmentEditor(segment: seg)
+        }
+    }
+
+    /// 正在回放到哪一句
+    private var playingSegmentID: UUID? {
+        guard let t = store.player.wallTime else { return nil }
+        return store.segments.last(where: { $0.time <= t.addingTimeInterval(0.3) })?.id
     }
 
     private var header: some View {
@@ -153,16 +171,26 @@ struct SegmentRow: View {
     @Environment(SessionStore.self) private var store
     let segment: Segment
     let isSelected: Bool
+    var isPlaying = false
     let fontSize: Double
     let autoSecondary: Bool
 
     var body: some View {
         HStack(alignment: .top, spacing: 10) {
-            Text(Fmt.clock(segment.time))
+            Button {
+                store.playFrom(segment)
+            } label: {
+                HStack(spacing: 2) {
+                    Text(Fmt.clock(segment.time))
+                    if isPlaying { Image(systemName: "speaker.wave.2.fill").font(.system(size: 9)) }
+                }
                 .font(.system(size: 11, design: .monospaced))
-                .foregroundStyle(.tertiary)
-                .frame(width: 58, alignment: .leading)
-                .padding(.top, 3)
+                .foregroundStyle(isPlaying ? Color.accentColor : Color.secondary.opacity(0.6))
+            }
+            .buttonStyle(.plain)
+            .frame(width: 66, alignment: .leading)
+            .padding(.top, 3)
+            .help("从这句开始播放录音")
             VStack(alignment: .leading, spacing: 4) {
                 if segment.language == .english {
                     Text(segment.bestRaw)
@@ -194,11 +222,15 @@ struct SegmentRow: View {
         }
         .padding(.vertical, 6)
         .padding(.horizontal, 8)
-        .background(isSelected ? Color.accentColor.opacity(0.13) : Color.clear, in: RoundedRectangle(cornerRadius: 8))
+        .background(isSelected ? Color.accentColor.opacity(0.13) : (isPlaying ? Color.yellow.opacity(0.16) : Color.clear), in: RoundedRectangle(cornerRadius: 8))
         .contentShape(Rectangle())
+        .onTapGesture(count: 2) { store.editingSegmentID = segment.id }
         .onTapGesture { store.toggleSelect(segment.id) }
         .contextMenu {
-            Button("复制原文") { copy(segment.text) }
+            Button("从这里播放录音") { store.playFrom(segment) }
+            Button("修改这句…") { store.editingSegmentID = segment.id }
+            Divider()
+            Button("复制原文") { copy(segment.bestRaw) }
             if let s = segment.secondary { Button(segment.language == .english ? "复制译文" : "复制校正文本") { copy(s) } }
             Divider()
             Button("问 AI 这一句") {
@@ -206,7 +238,10 @@ struct SegmentRow: View {
                 store.askAboutSelection()
             }
             Button("重新翻译/校正") { store.enqueueSecondary([segment.id]) }
+            Divider()
+            Button("删除这句", role: .destructive) { store.deleteSegment(segment.id) }
         }
+
     }
 
     private var rawHelp: String {

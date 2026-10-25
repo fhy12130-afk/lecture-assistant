@@ -83,6 +83,12 @@ struct QuestionSet: Identifiable, Codable {
     var error: String?
 }
 
+/// 一段录音文件和它开始录的时间（用来把转写里的时间对到录音里）
+struct AudioPart: Codable, Hashable {
+    var name: String     // 文件名（在录音文件夹里）或绝对路径
+    var start: Date
+}
+
 struct LectureSession: Codable {
     var id = UUID()
     var title: String
@@ -99,6 +105,7 @@ struct LectureSession: Codable {
     var lastSummarizedSegmentID: UUID?
     var titleIsAuto: Bool?
     var speakerIsAuto: Bool?
+    var audioParts: [AudioPart]?
 
     var isEmpty: Bool {
         segments.isEmpty && qas.isEmpty && questionSets.isEmpty && myNotes.isEmpty

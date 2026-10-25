@@ -56,6 +56,7 @@ struct Card<Content: View>: View {
 struct SummaryTab: View {
     @Environment(SessionStore.self) private var store
     @EnvironmentObject private var settings: AppSettings
+    @State private var editing = false
 
     var body: some View {
         ScrollView {
@@ -64,6 +65,12 @@ struct SummaryTab: View {
                     Text("整场摘要").font(.headline)
                     Spacer()
                     if store.isSummarizing { ProgressView().controlSize(.small) }
+                    if !store.overallSummary.isEmpty || editing {
+                        Button(editing ? "完成" : "修改") {
+                            if editing { store.scheduleSave() }
+                            editing.toggle()
+                        }
+                    }
                     Button("立即总结") { Task { await store.summarize() } }
                         .disabled(store.isSummarizing || store.segments.isEmpty)
                 }
@@ -73,7 +80,13 @@ struct SummaryTab: View {
                         MarkdownText(text: live.isEmpty ? "…" : live, fontSize: 13)
                     }
                 }
-                if store.overallSummary.isEmpty {
+                if editing {
+                    @Bindable var store = store
+                    TextEditor(text: $store.overallSummary)
+                        .font(.system(size: 13))
+                        .frame(minHeight: 260)
+                        .overlay(RoundedRectangle(cornerRadius: 6).strokeBorder(.quaternary))
+                } else if store.overallSummary.isEmpty {
                     Text("开始录音后每 \(settings.data.summaryIntervalMin) 分钟自动总结一次，也可以随时点「立即总结」。")
                         .foregroundStyle(.secondary)
                         .font(.callout)
@@ -90,7 +103,10 @@ struct SummaryTab: View {
                                 .foregroundStyle(.secondary)
                             MarkdownText(text: b.points, fontSize: 13)
                         }
-                        .contextMenu { Button("复制") { copyToPasteboard(b.points) } }
+                        .contextMenu {
+                            Button("复制") { copyToPasteboard(b.points) }
+                            Button("删除这段小结", role: .destructive) { store.deleteSummary(b.id) }
+                        }
                     }
                 }
             }
@@ -157,7 +173,14 @@ struct QATab: View {
                             .foregroundStyle(.secondary)
                             .padding(.top, 8)
                     }
-                    ForEach(store.qas) { q in QACard(item: q) }
+                    ForEach(store.qas) { q in
+                        QACard(item: q)
+                            .contextMenu {
+                                Button("复制回答") { copyToPasteboard(q.answer) }
+                                Button("重新回答") { store.retryQA(q.id) }
+                                Button("删除这条", role: .destructive) { store.deleteQA(q.id) }
+                            }
+                    }
                 }
                 .padding(14)
             }
@@ -300,6 +323,10 @@ struct QuestionsTab: View {
                             if set.status == .failed, !set.content.isEmpty, let e = set.error {
                                 Text(e).font(.caption).foregroundStyle(.orange)
                             }
+                        }
+                        .contextMenu {
+                            Button("复制") { copyToPasteboard(set.content) }
+                            Button("删除", role: .destructive) { store.deleteQuestionSet(set.id) }
                         }
                     }
                 }

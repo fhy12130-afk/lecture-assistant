@@ -4,7 +4,7 @@ import AppKit
 @main
 enum Main {
     static func main() {
-        if ["--selftest", "--searchtest", "--renderdemo"].contains(where: CommandLine.arguments.contains) {
+        if ["--selftest", "--searchtest", "--renderdemo", "--savetest", "--libtest"].contains(where: CommandLine.arguments.contains) {
             SelfTest.launch()
         } else {
             LectureAssistantApp.main()
@@ -51,6 +51,8 @@ struct LectureAssistantApp: App {
             CommandGroup(replacing: .newItem) {
                 Button("新建一场记录") { Task { await store.newSession() } }
                     .keyboardShortcut("n", modifiers: .command)
+                Button("打开记录…") { store.showLibrary = true }
+                    .keyboardShortcut("l", modifiers: .command)
             }
             CommandMenu("讲座") {
                 Button(store.isRecording ? "停止" : "开始") { store.toggleRecording() }

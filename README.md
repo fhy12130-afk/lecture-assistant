@@ -24,6 +24,8 @@ A native macOS app for academic talks: live transcription, English→Chinese tra
 - **自动总结**：每隔几分钟总结新内容，更新整场摘要，并列出和你的研究相关的点。
 - **选句解惑**：点选听不懂的句子（可多选）问 AI。它结合讲座上下文、你的背景和 Obsidian 笔记库里检索到的笔记来解释，还会给出可以追问的问题。可选联网搜索。
 - **准备提问**：生成 6 个问题，每个都有中英文问法、为什么值得问、对方可能怎么答。被点名时按 ⌘J，十秒左右给你一个能直接开口的问题和一句自我介绍。
+- **回看记录**：⌘L 打开记录列表，选一份以前的记录接着提问、生成问题、改句子和摘要，或者继续记。在 Obsidian 里手动改过的记录会按改过的版本载入。
+- **回放录音**：转写区顶部有播放条（±10 秒、拖动、0.75–2× 速度）；点任意一句前面的时间就从那句开始放，正在放的句子会高亮。
 - **本地存档**：Markdown 记录（摘要、问答、问题、完整转写）自动保存到 Obsidian，录音同时存成 m4a；应用意外退出后重开会恢复。
 
 ### 环境要求
@@ -66,6 +68,7 @@ cd lecture-assistant
 2. 听不懂的句子点一下，再点「直接问 AI」（⌘↩）；也可以在右侧「疑问」里写下具体问题。
 3. 右侧「提问」页里点「生成问题清单」；被点名时按 ⌘J。
 4. 换下一场讲座时按 ⌘N 新建记录。已有的录音可以从「更多 › 导入录音文件转写」导入。
+5. 回看：⌘L 打开记录列表，双击一份打开；双击一句可以修改，点句子前的时间从那里播放录音。
 
 ### 隐私
 
@@ -101,6 +104,8 @@ say -v Samantha -o /tmp/en.aiff "Today I will talk about neural operators as sur
 | `VaultSearch.swift` | Obsidian 笔记全文检索 |
 | `LocalASR.swift`、`scripts/asr_server.py` | 本地第二识别引擎（sherpa-onnx） |
 | `SessionStore*.swift` | 会话状态、自动保存、AI 任务调度 |
+| `RecordLibrary.swift`、`LibraryView.swift` | 记录列表、按存档或 Markdown 载入旧记录 |
+| `AudioPlayback.swift` | 录音回放、把句子时间对到录音位置 |
 | `ContentView.swift` 等 | SwiftUI 界面 |
 | `SelfTest.swift` | 无界面自测 |
 
@@ -117,6 +122,8 @@ say -v Samantha -o /tmp/en.aiff "Today I will talk about neural operators as sur
 - **Rolling summaries**: every few minutes the new part is summarized, the whole-talk summary is updated, and points relevant to your own research are listed.
 - **Ask about a sentence**: tap the sentences you didn't follow and ask the AI. It answers using the talk context, your profile, and notes retrieved from your Obsidian vault, and suggests follow-up questions. Web search is optional.
 - **Question prep**: six questions, each with Chinese and English wording, why it's worth asking, and a likely answer. Press ⌘J when you're called on to get one ready-to-say question plus a one-line self-introduction in about ten seconds.
+- **Review past records**: ⌘L opens the record list; reopen any past talk to keep asking questions, generate questions, edit sentences and the summary, or continue recording. Records edited by hand in Obsidian load with your edits.
+- **Playback**: a player bar above the transcript (±10 s, scrubbing, 0.75–2× speed); click the time in front of any sentence to play from there, and the sentence being played is highlighted.
 - **Local archive**: a Markdown record (summaries, Q&A, questions, full transcript) is saved to Obsidian as you go, along with an m4a recording. The session is restored if the app quits unexpectedly.
 
 ### Requirements
@@ -159,6 +166,7 @@ To keep personal details out of the code, put them in `~/Library/Application Sup
 2. Tap a sentence you didn't follow, then "直接问 AI" (⌘↩), or type a specific question in the 疑问 (Questions) tab.
 3. In the 提问 (Ask) tab, generate a question list; press ⌘J when you're called on.
 4. Press ⌘N to start a new record for the next talk. Existing recordings can be transcribed via More › Import audio.
+5. Review: ⌘L opens the record list; double-click one to open it. Double-click a sentence to edit it; click its time to play the recording from there.
 
 ### Privacy
 
@@ -194,6 +202,8 @@ Options: `--live 1` feeds the file at real-time speed through the microphone pat
 | `VaultSearch.swift` | Full-text search over the Obsidian vault |
 | `LocalASR.swift`, `scripts/asr_server.py` | Local second-opinion recognizer (sherpa-onnx) |
 | `SessionStore*.swift` | Session state, autosave, AI task scheduling |
+| `RecordLibrary.swift`, `LibraryView.swift` | Record list; loads past records from the JSON archive or the Markdown |
+| `AudioPlayback.swift` | Playback; maps sentence times to positions in the recordings |
 | `ContentView.swift` etc. | SwiftUI interface |
 | `SelfTest.swift` | Headless self-test |
 

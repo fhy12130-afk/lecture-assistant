@@ -35,6 +35,8 @@ enum SelfTest {
     @MainActor
     static func run() async -> Int32 {
         if let q = arg("--searchtest") { return await searchTest(q) }
+        if let dir = arg("--savetest") { return await saveTest(URL(fileURLWithPath: dir, isDirectory: true)) }
+        if flag("--libtest") { return await libTest() }
         if let demo = arg("--renderdemo") {
             let store = SessionStore(restore: false)
             store.loadDemo(URL(fileURLWithPath: demo))
@@ -147,6 +149,59 @@ enum SelfTest {
 
         if let dir = arg("--render") { render(store: store, to: URL(fileURLWithPath: dir, isDirectory: true)) }
         return finish(failures)
+    }
+
+    /// 只读：列出真实记录、逐个载入、检查录音能不能对上
+    @MainActor
+    static func libTest() async -> Int32 {
+        let store = SessionStore(restore: false)
+        store.isDemo = true
+        let recs = store.listRecords()
+        print("== 记录 \(recs.count) 份")
+        var bad = 0
+        for r in recs {
+            guard let s = RecordLibrary.load(r) else { print("  ✗ 载入失败 \(r.title)"); bad += 1; continue }
+            print("  · \(Fmt.day.string(from: r.date)) \(Fmt.hm(r.date)) \(r.title)｜\(r.speaker)｜存档=\(r.hasArchive) 句=\(s.segments.count) 小结=\(s.summaries.count) 问答=\(s.qas.count) 提问=\(s.questionSets.count) 录音=\(s.audioFiles)")
+            store.apply(s)
+            let parts = store.player.parts
+            for p in parts { print("      录音 \(p.name) 开始 \(Fmt.clock(p.start)) 时长 \(p.duration.map { String(format: "%.0fs", $0) } ?? "打不开")") }
+            if let seg = s.segments.dropFirst(s.segments.count / 2).first, !parts.isEmpty {
+                store.player.play(at: seg.time)
+                let ok = store.player.isPlaying
+                print("      从 \(Fmt.clock(seg.time)) 播放：\(ok ? "第\((store.player.current ?? 0) + 1)段 偏移 \(String(format: "%.1f", store.player.time))s" : (store.player.message ?? "失败"))")
+                if let w = store.player.wallTime { print("      播放位置对应 \(Fmt.clock(w))") }
+                store.player.stop()
+            }
+        }
+        return bad == 0 ? 0 : 1
+    }
+
+    /// 回归测试：新建记录、改题目之后，之前的记录文件不能被删
+    @MainActor
+    static func saveTest(_ dir: URL) async -> Int32 {
+        try? FileManager.default.removeItem(at: dir)
+        let store = SessionStore(restore: false)
+        store.isDemo = true
+        store.notesDirOverride = dir
+        let oldAuto = store.settings.data.autoSecondary
+        defer { store.settings.data.autoSecondary = oldAuto }
+        store.settings.data.autoSecondary = false
+        func fake(_ t: String) -> SpeechEngine.FinalResult { .init(text: t, start: Date(), duration: 2, language: .chinese) }
+        store.title = ""; store.titleIsAuto = true
+        store.addFinal(fake("第一场的第一句"))
+        store.flushSaves(); try? await Task.sleep(nanoseconds: 300_000_000)
+        store.title = "第一场"; store.flushSaves(); try? await Task.sleep(nanoseconds: 300_000_000)
+        try? await Task.sleep(nanoseconds: 61_000_000_000)   // 换一分钟，保证第二场的时间戳不同
+        await store.newSession()
+        store.addFinal(fake("第二场的第一句"))
+        store.flushSaves(); try? await Task.sleep(nanoseconds: 300_000_000)
+        store.title = "第二场"; store.flushSaves(); try? await Task.sleep(nanoseconds: 500_000_000)
+        store.flushSaves(); try? await Task.sleep(nanoseconds: 500_000_000)
+        let files = ((try? FileManager.default.contentsOfDirectory(atPath: dir.path)) ?? []).sorted()
+        print("== 文件：\(files)")
+        let ok = files.contains { $0.hasSuffix("第一场.md") } && files.contains { $0.hasSuffix("第二场.md") } && files.count == 2
+        print(ok ? "== 全部通过" : "== 失败：之前的记录丢了或多了文件")
+        return ok ? 0 : 1
     }
 
     @MainActor
